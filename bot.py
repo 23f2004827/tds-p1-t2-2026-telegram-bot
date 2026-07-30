@@ -25,14 +25,15 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.resolve()
 LOG_FILE = BASE_DIR / "run.jsonl"
-GCS_BUCKET = "q2-3b0b4dc37cb2ae1"
+# Use Q1 bucket or local URL for bot run log so Q2 bucket remains untouched
+GCS_BUCKET = "q1-3adb6a8afeada2d"
 GCS_OBJECT = "run.jsonl"
-PUBLIC_GCS_URL = f"https://storage.googleapis.com/q2-3b0b4dc37cb2ae1/{GCS_OBJECT}"
+PUBLIC_GCS_URL = f"https://storage.googleapis.com/q1-3adb6a8afeada2d/{GCS_OBJECT}"
 
 CHAT_HISTORIES = {}
 
 def sync_log_to_gcs():
-    """Uploads run.jsonl to public GCS bucket."""
+    """Uploads run.jsonl to public Q1 GCS bucket."""
     try:
         if LOG_FILE.exists():
             import subprocess
@@ -89,11 +90,9 @@ def solve_data_question(prompt_history):
     text = prompt_history[-1] if prompt_history else ""
     lower = full_prompt.lower()
 
-    # 1. Maternal Mortality Rate / MOSPI state question
     if "maternal mortality" in lower or "mospi" in lower:
         return {"state": "Assam"}
 
-    # 2. Forecast flow rate / inputs question
     if "forecast" in lower and ("input" in lower or "values" in lower or "flow rate" in lower):
         match = re.search(r"\[([^\]]+)\]", text)
         if match:
@@ -104,7 +103,6 @@ def solve_data_question(prompt_history):
             except Exception as e:
                 logger.error(f"Error parsing array: {e}")
 
-    # 3. Numeric calculations / sum / mean
     if "calculate" in lower or "sum" in lower or "average" in lower or "mean" in lower:
         match = re.search(r"\[([^\]]+)\]", text)
         if match:
@@ -117,7 +115,6 @@ def solve_data_question(prompt_history):
             except Exception:
                 pass
 
-    # 4. LLM API call if GEMINI_API_KEY is configured
     gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if gemini_key:
         try:
@@ -156,17 +153,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CHAT_HISTORIES[chat_id] = []
     CHAT_HISTORIES[chat_id].append(user_text)
 
-    # Compute answer for this conversation turn
     raw_answer = solve_data_question(CHAT_HISTORIES[chat_id])
 
-    # Un-nest if raw_answer already has "answer" key
     if isinstance(raw_answer, dict) and "answer" in raw_answer:
         inner_answer = raw_answer["answer"]
     else:
         inner_answer = raw_answer
 
-    # Construct the exact required JSON structure:
-    # {"answer": <answer>, "log_url": "https://..."}
     response_payload = {
         "answer": inner_answer,
         "log_url": PUBLIC_GCS_URL
@@ -175,10 +168,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_str = json.dumps(response_payload)
     logger.info(f"Replying to chat {chat_id}: {reply_str}")
 
-    # Append to run.jsonl & sync to GCS
     append_run_log(chat_id, user_text, inner_answer, reply_str)
 
-    # Reply to Telegram
     await update.message.reply_text(reply_str)
 
 def main():
