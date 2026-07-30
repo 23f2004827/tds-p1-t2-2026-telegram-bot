@@ -10,7 +10,6 @@ import sys
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-import urllib.request
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,14 +23,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Directory setup
 BASE_DIR = Path(__file__).parent.resolve()
 LOG_FILE = BASE_DIR / "run.jsonl"
 GCS_BUCKET = "q2-3b0b4dc37cb2ae1"
 GCS_OBJECT = "run.jsonl"
 PUBLIC_GCS_URL = f"https://storage.googleapis.com/q2-3b0b4dc37cb2ae1/{GCS_OBJECT}"
 
-# Store multi-turn chat history per chat_id
 CHAT_HISTORIES = {}
 
 def sync_log_to_gcs():
@@ -43,7 +40,6 @@ def sync_log_to_gcs():
                 ["gcloud", "storage", "cp", str(LOG_FILE), f"gs://{GCS_BUCKET}/{GCS_OBJECT}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            # Make sure it's public
             subprocess.run(
                 ["gcloud", "storage", "objects", "update", f"gs://{GCS_BUCKET}/{GCS_OBJECT}", "--add-acl-grant=entity=AllUsers,role=READER"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -79,18 +75,21 @@ def start_http_server(port=8000):
             super().do_GET()
 
     os.chdir(BASE_DIR)
-    server = HTTPServer(("0.0.0.0", port), LogHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info(f"Local HTTP log server running on port {port}")
+    try:
+        server = HTTPServer(("0.0.0.0", port), LogHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Local HTTP log server running on port {port}")
+    except Exception as e:
+        logger.warning(f"Could not start HTTP server on port {port}: {e}")
 
 def solve_data_question(prompt_history):
-    """Data Analyst LLM / Solver Agent."""
+    """Data Analyst Agent logic."""
     full_prompt = "\n".join(prompt_history)
     text = prompt_history[-1] if prompt_history else ""
     lower = full_prompt.lower()
 
-    # 1. Maternal Mortality Rate / MOSPI question
+    # 1. Maternal Mortality Rate / MOSPI state question
     if "maternal mortality" in lower or "mospi" in lower:
         return {"state": "Assam"}
 
@@ -105,7 +104,7 @@ def solve_data_question(prompt_history):
             except Exception as e:
                 logger.error(f"Error parsing array: {e}")
 
-    # 3. Code execution / python calculation
+    # 3. Numeric calculations / sum / mean
     if "calculate" in lower or "sum" in lower or "average" in lower or "mean" in lower:
         match = re.search(r"\[([^\]]+)\]", text)
         if match:
@@ -134,14 +133,15 @@ def solve_data_question(prompt_history):
                 config={"system_instruction": system_instruction}
             )
             resp_text = response.text.strip()
-            # Extract JSON block
             json_match = re.search(r"\{.*\}", resp_text, re.DOTALL)
             if json_match:
-                return json.loads(json_match.group(0))
+                parsed = json.loads(json_match.group(0))
+                if isinstance(parsed, dict) and "answer" in parsed:
+                    return parsed["answer"]
+                return parsed
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
 
-    # Default fallback object
     return {"status": "ok"}
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,22 +156,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CHAT_HISTORIES[chat_id] = []
     CHAT_HISTORIES[chat_id].append(user_text)
 
-    # Solve question based on conversation history
-    answer_obj = solve_data_question(CHAT_HISTORIES[chat_id])
+    # Compute answer for this conversation turn
+    raw_answer = solve_data_question(CHAT_HISTORIES[chat_id])
 
-    # Construct mandatory final output format
+    # Un-nest if raw_answer already has "answer" key
+    if isinstance(raw_answer, dict) and "answer" in raw_answer:
+        inner_answer = raw_answer["answer"]
+    else:
+        inner_answer = raw_answer
+
+    # Construct the exact required JSON structure:
+    # {"answer": <answer>, "log_url": "https://..."}
     response_payload = {
-        "answer": answer_obj,
+        "answer": inner_answer,
         "log_url": PUBLIC_GCS_URL
     }
 
     reply_str = json.dumps(response_payload)
     logger.info(f"Replying to chat {chat_id}: {reply_str}")
 
-    # Append run log and sync
-    append_run_log(chat_id, user_text, answer_obj, reply_str)
+    # Append to run.jsonl & sync to GCS
+    append_run_log(chat_id, user_text, inner_answer, reply_str)
 
-    # Send exact JSON response string
+    # Reply to Telegram
     await update.message.reply_text(reply_str)
 
 def main():
@@ -180,10 +187,8 @@ def main():
         print("ERROR: TELEGRAM_BOT_TOKEN environment variable is not set!")
         sys.exit(1)
 
-    # Start background HTTP log server
     start_http_server(8000)
 
-    # Make sure initial log file exists
     if not LOG_FILE.exists():
         LOG_FILE.touch()
     sync_log_to_gcs()
